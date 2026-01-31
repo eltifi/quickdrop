@@ -1,0 +1,5 @@
+target/
+uploads/
+tests/
+.env
+.DS_Store
