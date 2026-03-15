@@ -388,21 +388,28 @@ fn generate_id(len: usize) -> String {
 }
 
 async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
-    let mut entries = fs::read_dir(&config.upload_dir).await?;
-    let now = SystemTime::now();
-    let max_age = Duration::from_secs((config.retention_minutes * 60) as u64);
+    let upload_dir = config.upload_dir.clone();
+    let retention_minutes = config.retention_minutes;
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let metadata = entry.metadata().await?;
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(age) = now.duration_since(modified) {
-                 if age > max_age {
-                     let path = entry.path();
-                     println!("[Auto-Delete] Removed expired file: {:?}", path);
-                     fs::remove_file(path).await?;
-                 }
+    tokio::task::spawn_blocking(move || {
+        let entries = std::fs::read_dir(upload_dir)?;
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs((retention_minutes * 60) as u64);
+
+        for entry in entries {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    if age > max_age {
+                        let path = entry.path();
+                        println!("[Auto-Delete] Removed expired file: {:?}", path);
+                        std::fs::remove_file(path)?;
+                    }
+                }
             }
         }
-    }
-    Ok(())
+        Ok::<(), BoxError>(())
+    })
+    .await?
 }
