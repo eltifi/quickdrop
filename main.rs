@@ -203,41 +203,59 @@ async fn handle_request(req: Request<hyper::body::Incoming>, state: AppState) ->
    Ok(Response::from_parts(parts, body))
 }
 
-async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, filename_hint: String) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
-    // Check API Key
-    if let Some(ref key) = state.config.key {
+fn check_api_key(req: &Request<hyper::body::Incoming>, key: &Option<String>) -> Result<(), Response<BoxBody<Bytes, BoxError>>> {
+    if let Some(key) = key {
         let authorized = req.headers().get("x-key")
             .and_then(|v| v.to_str().ok())
             .map(|v| v == key)
             .unwrap_or(false);
             
         if !authorized {
-            let res = Response::new(empty());
-             return Ok(res);
+            return Err(Response::new(empty()));
         }
     }
+    Ok(())
+}
 
-    // Check extension
-    let extension = Path::new(&filename_hint).extension().and_then(|s| s.to_str()).unwrap_or("txt").to_lowercase();
+fn check_extension(filename_hint: &str, allowed_types: &Option<Vec<String>>) -> Result<String, Response<BoxBody<Bytes, BoxError>>> {
+    let extension = Path::new(filename_hint).extension().and_then(|s| s.to_str()).unwrap_or("txt").to_lowercase();
     let original_ext = format!(".{}", extension); // ensure dot
 
-    if let Some(ref allowed) = state.config.allowed_file_types {
+    if let Some(allowed) = allowed_types {
          if !allowed.contains(&original_ext) {
              let mut res = Response::new(full(format!("File type not allowed. Allowed: {:?}\n", allowed)));
              *res.status_mut() = StatusCode::BAD_REQUEST;
-             return Ok(res);
+             return Err(res);
          }
     }
-    
-    // Check Content-Length (Early rejection)
-    if state.config.max_file_size > 0 {
+    Ok(original_ext)
+}
+
+fn check_content_length(req: &Request<hyper::body::Incoming>, max_size: u64) -> Result<(), Response<BoxBody<Bytes, BoxError>>> {
+    if max_size > 0 {
          if let Some(len) = req.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
-             if len > state.config.max_file_size {
-                 let mut res = Response::new(full(format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
+             if len > max_size {
+                 let mut res = Response::new(full(format!("File too large. Max size: {} bytes\n", max_size)));
                  *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
-                 return Ok(res);
+                 return Err(res);
              }
          }
+    }
+    Ok(())
+}
+
+async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, filename_hint: String) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
+    if let Err(res) = check_api_key(&req, &state.config.key) {
+        return Ok(res);
+    }
+
+    let original_ext = match check_extension(&filename_hint, &state.config.allowed_file_types) {
+        Ok(ext) => ext,
+        Err(res) => return Ok(res),
+    };
+
+    if let Err(res) = check_content_length(&req, state.config.max_file_size) {
+        return Ok(res);
     }
 
     // Generate ID
