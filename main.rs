@@ -68,6 +68,7 @@ impl Config {
 #[derive(Clone)]
 struct AppState {
     config: Config,
+    logger: tokio::sync::mpsc::Sender<String>,
 }
 
 // --- Basic Response Helpers ---
@@ -106,7 +107,14 @@ async fn main() -> Result<(), BoxError> {
     println!("Storage: {:?}", config.upload_dir);
     println!("Retention Policy: Files older than {} minutes will be deleted automatically.", config.retention_minutes);
 
-    let app_state = AppState { config: config.clone() };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10000);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            println!("{}", msg);
+        }
+    });
+
+    let app_state = AppState { config: config.clone(), logger: tx };
 
     // Background Cleanup Task
     let cleanup_state = app_state.clone();
@@ -154,7 +162,7 @@ async fn handle_request(req: Request<hyper::body::Incoming>, state: AppState) ->
     
     // Minimal Logging (No chrono)
    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
-   println!("[{}] {} {}", now, req.method(), req.uri());
+   let _ = state.logger.try_send(format!("[{}] {} {}", now, req.method(), req.uri()));
 
    let response = match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => Ok(Response::new(full("OK\n"))),
