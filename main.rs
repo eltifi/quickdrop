@@ -13,7 +13,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 use tokio_util::io::ReaderStream;
 
@@ -256,7 +256,8 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
         .to_string();
 
     match File::create(&file_path).await {
-        Ok(mut file) => {
+        Ok(file) => {
+            let mut file = BufWriter::new(file);
             let mut body = req.into_body();
             let mut uploaded_size = 0u64;
             let mut failed = false;
@@ -304,6 +305,9 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
                  *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                  return Ok(res);
             }
+
+            // Ensure the underlying file receives all buffered data and completes gracefully
+            let _ = file.shutdown().await;
         },
         Err(e) => {
             eprintln!("Failed to create file: {}", e);
