@@ -19,7 +19,7 @@ use tokio_util::io::ReaderStream;
 
 // --- Config ---
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct Config {
     upload_dir: PathBuf,
     key: Option<String>,
@@ -405,4 +405,106 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn clear_env() {
+        unsafe {
+            env::remove_var("UPLOAD_DIR");
+            env::remove_var("KEY");
+            env::remove_var("ID_LENGTH");
+            env::remove_var("MAX_FILE_SIZE");
+            env::remove_var("ALLOWED_FILE_TYPES");
+            env::remove_var("RETENTION_MINUTES");
+        }
+    }
+
+    #[test]
+    fn test_config_from_env_defaults() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_env();
+
+        let config = Config::from_env();
+
+        assert_eq!(config.upload_dir, PathBuf::from("uploads"));
+        assert_eq!(config.key, None);
+        assert_eq!(config.id_length, 5);
+        assert_eq!(config.max_file_size, 1048576);
+        assert_eq!(config.allowed_file_types, None);
+        assert_eq!(config.retention_minutes, 60);
+    }
+
+    #[test]
+    fn test_config_from_env_custom() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_env();
+
+        unsafe {
+            env::set_var("UPLOAD_DIR", "custom_uploads");
+            env::set_var("KEY", "secret_key");
+            env::set_var("ID_LENGTH", "10");
+            env::set_var("MAX_FILE_SIZE", "2048");
+            env::set_var("ALLOWED_FILE_TYPES", ".jpg,.png");
+            env::set_var("RETENTION_MINUTES", "120");
+        }
+
+        let config = Config::from_env();
+
+        assert_eq!(config.upload_dir, PathBuf::from("custom_uploads"));
+        assert_eq!(config.key, Some("secret_key".to_string()));
+        assert_eq!(config.id_length, 10);
+        assert_eq!(config.max_file_size, 2048);
+        assert_eq!(config.allowed_file_types, Some(vec![".jpg".to_string(), ".png".to_string()]));
+        assert_eq!(config.retention_minutes, 120);
+    }
+
+    #[test]
+    fn test_config_from_env_invalid_numeric() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_env();
+
+        unsafe {
+            env::set_var("ID_LENGTH", "abc");
+            env::set_var("MAX_FILE_SIZE", "not_a_number");
+            env::set_var("RETENTION_MINUTES", "invalid");
+        }
+
+        let config = Config::from_env();
+
+        assert_eq!(config.id_length, 5); // Default
+        assert_eq!(config.max_file_size, 1048576); // Default
+        assert_eq!(config.retention_minutes, 60); // Default
+    }
+
+    #[test]
+    fn test_config_from_env_allowed_file_types() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_env();
+
+        unsafe {
+            env::set_var("ALLOWED_FILE_TYPES", " .JPG, .png , GIF ");
+        }
+
+        let config = Config::from_env();
+
+        let expected = Some(vec![
+            ".jpg".to_string(),
+            ".png".to_string(),
+            "gif".to_string(),
+        ]);
+        assert_eq!(config.allowed_file_types, expected);
+
+        unsafe {
+            env::set_var("ALLOWED_FILE_TYPES", "");
+        }
+        let config_empty = Config::from_env();
+        assert_eq!(config_empty.allowed_file_types, None);
+    }
 }
