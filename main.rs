@@ -203,7 +203,12 @@ async fn handle_request(req: Request<hyper::body::Incoming>, state: AppState) ->
    Ok(Response::from_parts(parts, body))
 }
 
-async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, filename_hint: String) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
+async fn handle_upload<B>(req: Request<B>, state: AppState, filename_hint: String) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError>
+where
+    B: hyper::body::Body + Unpin,
+    B::Data: Into<Bytes>,
+    B::Error: Into<BoxError> + std::fmt::Debug,
+{
     // Check API Key
     if let Some(ref key) = state.config.key {
         let authorized = req.headers().get("x-key")
@@ -273,7 +278,8 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
                 };
 
                 if let Ok(data) = frame.into_data() {
-                    uploaded_size += data.len() as u64;
+                    let bytes_data: Bytes = data.into();
+                    uploaded_size += bytes_data.len() as u64;
                     if state.config.max_file_size > 0 && uploaded_size > state.config.max_file_size {
 
                         let mut res = Response::new(full(format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
@@ -283,7 +289,7 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
                         let _ = fs::remove_file(&file_path).await;
                         return Ok(res);
                     }
-                    if let Err(e) = file.write_all(&data).await {
+                    if let Err(e) = file.write_all(&bytes_data).await {
                         eprintln!("Write error: {}", e);
                         failed = true;
                     }
@@ -405,4 +411,144 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Full;
+    use bytes::Bytes;
+
+    // Helper to create AppState with temporary directory
+    async fn setup_state(max_size: u64, allowed_types: Option<Vec<String>>, key: Option<String>) -> (AppState, PathBuf) {
+        let dir = env::temp_dir().join(format!("quickdrop_test_{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let config = Config {
+            upload_dir: dir.clone(),
+            key,
+            id_length: 5,
+            max_file_size: max_size,
+            allowed_file_types: allowed_types,
+            retention_minutes: 60,
+        };
+
+        (AppState { config }, dir)
+    }
+
+    async fn teardown(dir: PathBuf) {
+        let _ = fs::remove_dir_all(dir).await;
+    }
+
+    fn make_request(method: Method, body: &'static [u8], key: Option<&str>, content_length: Option<u64>) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder().method(method).uri("/");
+
+        if let Some(k) = key {
+            builder = builder.header("x-key", k);
+        }
+
+        if let Some(cl) = content_length {
+            builder = builder.header("content-length", cl.to_string());
+        }
+
+        builder.body(Full::new(Bytes::from_static(body))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_happy_path() {
+        let (state, dir) = setup_state(1024, None, None).await;
+
+        let content = b"hello world";
+        let req = make_request(Method::PUT, content, None, Some(content.len() as u64));
+
+        let res = handle_upload(req, state, "test.txt".to_string()).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Verify file is on disk
+        let mut files = fs::read_dir(&dir).await.unwrap();
+        let entry = files.next_entry().await.unwrap().unwrap();
+        let file_name = entry.file_name().into_string().unwrap();
+
+        assert!(file_name.ends_with(".txt"));
+        assert_eq!(file_name.len(), 5 + 4); // id length 5 + ".txt" length 4
+
+        let file_content = fs::read_to_string(entry.path()).await.unwrap();
+        assert_eq!(file_content, "hello world");
+
+        teardown(dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_unauthorized() {
+        let (state, dir) = setup_state(1024, None, Some("secret".to_string())).await;
+
+        let content = b"hello world";
+
+        // No key
+        let req1 = make_request(Method::PUT, content, None, Some(content.len() as u64));
+        let res1 = handle_upload(req1, state.clone(), "test.txt".to_string()).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // Let's actually check the response body size for empty
+        let body_bytes = res1.into_body().collect().await.unwrap().to_bytes();
+        assert!(body_bytes.is_empty(), "Expected empty response for unauthorized");
+
+        // Wrong key
+        let req2 = make_request(Method::PUT, content, Some("wrong_secret"), Some(content.len() as u64));
+        let res2 = handle_upload(req2, state.clone(), "test.txt".to_string()).await.unwrap();
+        let body_bytes2 = res2.into_body().collect().await.unwrap().to_bytes();
+        assert!(body_bytes2.is_empty(), "Expected empty response for wrong key");
+
+        // Correct key
+        let req3 = make_request(Method::PUT, content, Some("secret"), Some(content.len() as u64));
+        let res3 = handle_upload(req3, state.clone(), "test.txt".to_string()).await.unwrap();
+        let body_bytes3 = res3.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body_bytes3.is_empty(), "Expected success with correct key");
+
+        teardown(dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_invalid_extension() {
+        let allowed = Some(vec![".txt".to_string(), ".png".to_string()]);
+        let (state, dir) = setup_state(1024, allowed, None).await;
+
+        let content = b"malicious executable";
+
+        // Invalid extension
+        let req1 = make_request(Method::PUT, content, None, Some(content.len() as u64));
+        let res1 = handle_upload(req1, state.clone(), "test.exe".to_string()).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::BAD_REQUEST);
+
+        // Valid extension
+        let req2 = make_request(Method::PUT, content, None, Some(content.len() as u64));
+        let res2 = handle_upload(req2, state.clone(), "test.txt".to_string()).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+
+        teardown(dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_file_too_large() {
+        let (state, dir) = setup_state(10, None, None).await;
+
+        let content = b"this is larger than 10 bytes";
+
+        // Fails via content-length header
+        let req1 = make_request(Method::PUT, content, None, Some(content.len() as u64));
+        let res1 = handle_upload(req1, state.clone(), "test.txt".to_string()).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Fails during streaming (simulate missing content-length header)
+        let req2 = make_request(Method::PUT, content, None, None);
+        let res2 = handle_upload(req2, state.clone(), "test2.txt".to_string()).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Verify no files are left on disk
+        let mut files = fs::read_dir(&dir).await.unwrap();
+        assert!(files.next_entry().await.unwrap().is_none(), "Expected no files on disk");
+
+        teardown(dir).await;
+    }
 }
