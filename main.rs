@@ -206,12 +206,11 @@ async fn handle_request(req: Request<hyper::body::Incoming>, state: AppState) ->
 async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, filename_hint: String) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
     // Check API Key
     if let Some(ref key) = state.config.key {
-        let authorized = req.headers().get("x-key")
+        let provided_key = req.headers().get("x-key")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == key)
-            .unwrap_or(false);
-            
-        if !authorized {
+            .unwrap_or("");
+
+        if !constant_time_eq(provided_key, key) {
             let res = Response::new(empty());
              return Ok(res);
         }
@@ -375,6 +374,21 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
 }
 
 // Helpers
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+
+    a_bytes
+        .iter()
+        .zip(b_bytes.iter())
+        .fold(0, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 fn generate_id(len: usize) -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -405,4 +419,28 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_comparison() {
+        let key = "secret_key_123";
+
+        let cases = vec![
+            ("secret_key_123", true),
+            ("secret_key_124", false),
+            ("secret_key_12", false),
+            ("secret_key_1234", false),
+            ("", false),
+            ("wrong", false),
+        ];
+
+        for (provided, expected) in cases {
+            let authorized = constant_time_eq(provided, key);
+            assert_eq!(authorized, expected, "Comparison failed for provided key: {}", provided);
+        }
+    }
 }
