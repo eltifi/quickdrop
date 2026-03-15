@@ -406,3 +406,102 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::time::{SystemTime, Duration};
+    use tempfile::tempdir;
+
+    fn create_test_config(upload_dir: PathBuf, retention_minutes: i64) -> Config {
+        Config {
+            upload_dir,
+            key: None,
+            id_length: 5,
+            max_file_size: 1048576,
+            allowed_file_types: None,
+            retention_minutes,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_keeps_recent_files() {
+        let dir = tempdir().unwrap();
+        let config = create_test_config(dir.path().to_path_buf(), 10);
+
+        // Create a file
+        let file_path = dir.path().join("recent.txt");
+        let file = File::create(&file_path).unwrap();
+
+        // Set modification time to 5 minutes ago
+        let modified_time = SystemTime::now() - Duration::from_secs(5 * 60);
+        file.set_times(std::fs::FileTimes::new().set_modified(modified_time)).unwrap();
+        drop(file);
+
+        // Run cleanup
+        run_cleanup(&config).await.unwrap();
+
+        // File should still exist
+        assert!(file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_deletes_old_files() {
+        let dir = tempdir().unwrap();
+        let config = create_test_config(dir.path().to_path_buf(), 10);
+
+        // Create a file
+        let file_path = dir.path().join("old.txt");
+        let file = File::create(&file_path).unwrap();
+
+        // Set modification time to 15 minutes ago
+        let modified_time = SystemTime::now() - Duration::from_secs(15 * 60);
+        file.set_times(std::fs::FileTimes::new().set_modified(modified_time)).unwrap();
+        drop(file);
+
+        // Run cleanup
+        run_cleanup(&config).await.unwrap();
+
+        // File should be deleted
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_mixed_files() {
+        let dir = tempdir().unwrap();
+        let config = create_test_config(dir.path().to_path_buf(), 10);
+
+        // Create recent file
+        let recent_path = dir.path().join("recent.txt");
+        let recent_file = File::create(&recent_path).unwrap();
+        let recent_time = SystemTime::now() - Duration::from_secs(5 * 60);
+        recent_file.set_times(std::fs::FileTimes::new().set_modified(recent_time)).unwrap();
+        drop(recent_file);
+
+        // Create old file
+        let old_path = dir.path().join("old.txt");
+        let old_file = File::create(&old_path).unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(15 * 60);
+        old_file.set_times(std::fs::FileTimes::new().set_modified(old_time)).unwrap();
+        drop(old_file);
+
+        // Run cleanup
+        run_cleanup(&config).await.unwrap();
+
+        // Verify
+        assert!(recent_path.exists());
+        assert!(!old_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_missing_dir() {
+        let config = create_test_config(PathBuf::from("/path/to/nonexistent/dir/xyz"), 10);
+
+        // Run cleanup
+        let result = run_cleanup(&config).await;
+
+        // Should error
+        assert!(result.is_err());
+    }
+}
