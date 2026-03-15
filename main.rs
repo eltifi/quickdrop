@@ -406,3 +406,180 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use tokio::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+
+    async fn setup_test_server(app_state: AppState) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app_state_clone = app_state.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                let io = TokioIo::new(stream);
+                let app_state = app_state_clone.clone();
+
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(io, service_fn(move |req| handle_request(req, app_state.clone())))
+                        .await;
+                });
+            }
+        });
+
+        addr
+    }
+
+    async fn make_request(addr: SocketAddr, req: Request<BoxBody<Bytes, BoxError>>) -> (hyper::StatusCode, hyper::HeaderMap, String) {
+        use hyper::client::conn::http1;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake(io).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let mut res = sender.send_request(req).await.unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+
+        let mut body_bytes = Vec::new();
+        while let Some(next) = res.frame().await {
+            if let Ok(frame) = next {
+                if let Ok(data) = frame.into_data() {
+                    body_bytes.extend_from_slice(&data);
+                }
+            }
+        }
+        let body_str = String::from_utf8(body_bytes).unwrap();
+
+        (status, headers, body_str)
+    }
+
+    fn default_config() -> Config {
+        Config {
+            upload_dir: PathBuf::from("test_uploads"),
+            key: None,
+            id_length: 5,
+            max_file_size: 1024,
+            allowed_file_types: None,
+            retention_minutes: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_routing_health() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/health", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (status, _, body) = make_request(addr, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "OK\n");
+    }
+
+    #[tokio::test]
+    async fn test_routing_robots() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/robots.txt", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (status, headers, body) = make_request(addr, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+        assert_eq!(body, "User-agent: *\nDisallow: /");
+    }
+
+    #[tokio::test]
+    async fn test_routing_favicon() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/favicon.ico", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (status, _, body) = make_request(addr, req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_routing_root() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (status, _, body) = make_request(addr, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_routing_not_found() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("POST") // Invalid method
+            .uri(format!("http://{}/something", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (status, _, body) = make_request(addr, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "Not Found\n");
+    }
+
+    #[tokio::test]
+    async fn test_security_headers() {
+        let state = AppState { config: default_config() };
+        let addr = setup_test_server(state).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/health", addr))
+            .header("Host", addr.to_string())
+            .body(empty())
+            .unwrap();
+
+        let (_, headers, _) = make_request(addr, req).await;
+        assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert_eq!(headers.get("X-Frame-Options").unwrap(), "DENY");
+        assert_eq!(headers.get("Strict-Transport-Security").unwrap(), "max-age=31536000; includeSubDomains");
+    }
+}
