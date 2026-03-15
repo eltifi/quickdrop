@@ -365,7 +365,12 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
         let boxed_body = BodyExt::boxed(stream_body);
 
         let mut res = Response::new(boxed_body);
-        res.headers_mut().insert("Content-Disposition", format!("attachment; filename=\"{}\"", filename).parse().unwrap());
+        let sanitized_filename = filename.replace(|c: char| c.is_control() || c == '"', "_");
+        if let Ok(header_val) = format!("attachment; filename=\"{}\"", sanitized_filename).parse() {
+            res.headers_mut().insert("Content-Disposition", header_val);
+        } else {
+            res.headers_mut().insert("Content-Disposition", "attachment".parse().unwrap());
+        }
         Ok(res)
     } else {
         let mut res = Response::new(full("File not found\n"));
