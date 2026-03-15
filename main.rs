@@ -317,6 +317,19 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
     Ok(Response::new(full(file_url)))
 }
 
+async fn find_file_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
+    if let Ok(mut entries) = fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(name) = entry.file_name().into_string() {
+                if name.starts_with(prefix) {
+                    return Some(dir.join(name));
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
     // Check for extension in ID
     let target_path = if let Some(_ext) = Path::new(&id).extension() {
@@ -324,18 +337,7 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
          if p.exists() { Some(p) } else { None }
     } else {
         // Search for file starting with ID
-        let mut match_path = None;
-        if let Ok(mut entries) = fs::read_dir(&state.config.upload_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                 if let Ok(name) = entry.file_name().into_string() {
-                     if name.starts_with(&format!("{}.", id)) {
-                         match_path = Some(state.config.upload_dir.join(name));
-                         break;
-                     }
-                 }
-            }
-        }
-        match_path
+        find_file_by_prefix(&state.config.upload_dir, &format!("{}.", id)).await
     };
 
     if let Some(path) = target_path {
