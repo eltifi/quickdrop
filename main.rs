@@ -394,14 +394,19 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let metadata = entry.metadata().await?;
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(age) = now.duration_since(modified) {
-                 if age > max_age {
-                     let path = entry.path();
-                     println!("[Auto-Delete] Removed expired file: {:?}", path);
-                     fs::remove_file(path).await?;
-                 }
-            }
+
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+
+        if age > max_age {
+            let path = entry.path();
+            println!("[Auto-Delete] Removed expired file: {:?}", path);
+            fs::remove_file(path).await?;
         }
     }
     Ok(())
