@@ -1,6 +1,8 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -68,6 +70,7 @@ impl Config {
 #[derive(Clone)]
 struct AppState {
     config: Config,
+    cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
 // --- Basic Response Helpers ---
@@ -106,7 +109,19 @@ async fn main() -> Result<(), BoxError> {
     println!("Storage: {:?}", config.upload_dir);
     println!("Retention Policy: Files older than {} minutes will be deleted automatically.", config.retention_minutes);
 
-    let app_state = AppState { config: config.clone() };
+    let cache: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    if let Ok(entries) = std::fs::read_dir(&config.upload_dir) {
+        let mut w = cache.write().unwrap();
+        for entry in entries.flatten() {
+             if let Ok(name) = entry.file_name().into_string() {
+                 if let Some(id) = name.split('.').next() {
+                     w.insert(id.to_string(), name);
+                 }
+             }
+        }
+    }
+
+    let app_state = AppState { config: config.clone(), cache };
 
     // Background Cleanup Task
     let cleanup_state = app_state.clone();
@@ -124,7 +139,7 @@ async fn main() -> Result<(), BoxError> {
          
          loop {
              interval.tick().await; 
-             if let Err(e) = run_cleanup(&cleanup_state.config).await {
+             if let Err(e) = run_cleanup(&cleanup_state).await {
                  eprintln!("Cleanup Error: {}", e);
              }
          }
@@ -313,6 +328,8 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
         }
     }
     
+    state.cache.write().unwrap().insert(id.clone(), new_filename);
+
     let file_url = format!("{}://{}/{}\n", proto, host, id); 
     Ok(Response::new(full(file_url)))
 }
@@ -323,18 +340,7 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
          let p = state.config.upload_dir.join(&id);
          if p.exists() { Some(p) } else { None }
     } else {
-        // Search for file starting with ID
-        let mut match_path = None;
-        if let Ok(mut entries) = fs::read_dir(&state.config.upload_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                 if let Ok(name) = entry.file_name().into_string() {
-                     if name.starts_with(&format!("{}.", id)) {
-                         match_path = Some(state.config.upload_dir.join(name));
-                         break;
-                     }
-                 }
-            }
-        }
+        let match_path = state.cache.read().unwrap().get(&id).map(|name| state.config.upload_dir.join(name));
         match_path
     };
 
@@ -387,22 +393,31 @@ fn generate_id(len: usize) -> String {
         .collect()
 }
 
-async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
-    let mut entries = fs::read_dir(&config.upload_dir).await?;
-    let now = SystemTime::now();
-    let max_age = Duration::from_secs((config.retention_minutes * 60) as u64);
+async fn run_cleanup(state: &AppState) -> Result<(), BoxError> {
+    let state_clone = state.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+        let entries = std::fs::read_dir(&state_clone.config.upload_dir)?;
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs((state_clone.config.retention_minutes * 60) as u64);
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let metadata = entry.metadata().await?;
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(age) = now.duration_since(modified) {
-                 if age > max_age {
-                     let path = entry.path();
-                     println!("[Auto-Delete] Removed expired file: {:?}", path);
-                     fs::remove_file(path).await?;
-                 }
+        for entry in entries.flatten() {
+            let metadata = entry.metadata()?;
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    if age > max_age {
+                        let path = entry.path();
+                        println!("[Auto-Delete] Removed expired file: {:?}", path);
+                        if std::fs::remove_file(&path).is_ok() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if let Some(id) = name.split('.').next() {
+                                    state_clone.cache.write().unwrap().remove(id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    }).await?
 }
