@@ -406,3 +406,32 @@ async fn run_cleanup(config: &Config) -> Result<(), BoxError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_id_length() {
+        assert_eq!(generate_id(0).len(), 0);
+        assert_eq!(generate_id(1).len(), 1);
+        assert_eq!(generate_id(5).len(), 5);
+        assert_eq!(generate_id(100).len(), 100);
+    }
+
+    #[test]
+    fn test_generate_id_characters() {
+        let id = generate_id(100);
+        let charset = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for c in id.chars() {
+            assert!(charset.contains(&(c as u8)), "Character {} not in charset", c);
+        }
+    }
+
+    #[test]
+    fn test_generate_id_randomness() {
+        let id1 = generate_id(50);
+        let id2 = generate_id(50);
+        assert_ne!(id1, id2, "Generated IDs should be random");
+    }
+}
