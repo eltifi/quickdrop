@@ -318,6 +318,12 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
 }
 
 async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        let mut res = Response::new(full("Bad Request\n"));
+        *res.status_mut() = StatusCode::BAD_REQUEST;
+        return Ok(res);
+    }
+
     // Check for extension in ID
     let target_path = if let Some(_ext) = Path::new(&id).extension() {
          let p = state.config.upload_dir.join(&id);
