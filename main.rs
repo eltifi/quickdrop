@@ -86,6 +86,12 @@ fn empty() -> BoxBody<Bytes, BoxError> {
         .boxed()
 }
 
+fn error_response<T: Into<String>>(status: StatusCode, message: T) -> Response<BoxBody<Bytes, BoxError>> {
+    let mut res = Response::new(full(message.into()));
+    *res.status_mut() = status;
+    res
+}
+
 // --- Main ---
 
 #[tokio::main]
@@ -178,20 +184,12 @@ async fn handle_request(req: Request<hyper::body::Incoming>, state: AppState) ->
              let id = path.trim_start_matches('/').to_string();
              handle_download(id, state).await
         },
-        _ => {
-            let mut res = Response::new(full("Not Found\n"));
-            *res.status_mut() = StatusCode::NOT_FOUND;
-            Ok(res)
-        }
+        _ => Ok(error_response(StatusCode::NOT_FOUND, "Not Found\n"))
    };
    
    let res = match response {
        Ok(r) => r,
-       Err(_e) => {
-           let mut r = Response::new(full("Internal Server Error\n"));
-           *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-           r
-       }
+       Err(_e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n")
    };
 
     // Security Headers
@@ -223,9 +221,7 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
 
     if let Some(ref allowed) = state.config.allowed_file_types {
          if !allowed.contains(&original_ext) {
-             let mut res = Response::new(full(format!("File type not allowed. Allowed: {:?}\n", allowed)));
-             *res.status_mut() = StatusCode::BAD_REQUEST;
-             return Ok(res);
+             return Ok(error_response(StatusCode::BAD_REQUEST, format!("File type not allowed. Allowed: {:?}\n", allowed)));
          }
     }
     
@@ -233,9 +229,7 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
     if state.config.max_file_size > 0 {
          if let Some(len) = req.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
              if len > state.config.max_file_size {
-                 let mut res = Response::new(full(format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
-                 *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
-                 return Ok(res);
+                 return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE, format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
              }
          }
     }
@@ -275,13 +269,10 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
                 if let Ok(data) = frame.into_data() {
                     uploaded_size += data.len() as u64;
                     if state.config.max_file_size > 0 && uploaded_size > state.config.max_file_size {
-
-                        let mut res = Response::new(full(format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
-                        *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
                         // Cleanup
                         let _ = file.shutdown().await;
                         let _ = fs::remove_file(&file_path).await;
-                        return Ok(res);
+                        return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE, format!("File too large. Max size: {} bytes\n", state.config.max_file_size)));
                     }
                     if let Err(e) = file.write_all(&data).await {
                         eprintln!("Write error: {}", e);
@@ -293,23 +284,17 @@ async fn handle_upload(req: Request<hyper::body::Incoming>, state: AppState, fil
             if failed {
                  let _ = file.shutdown().await;
                  let _ = fs::remove_file(&file_path).await;
-                 let mut res = Response::new(full("Error writing to file\n"));
-                 *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                 return Ok(res);
+                 return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Error writing to file\n"));
             }
 
             if let Err(_) = file.flush().await {
                 let _ = fs::remove_file(&file_path).await;
-                 let mut res = Response::new(full("Error writing to file\n"));
-                 *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                 return Ok(res);
+                 return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Error writing to file\n"));
             }
         },
         Err(e) => {
             eprintln!("Failed to create file: {}", e);
-             let mut res = Response::new(full("Error saving file\n"));
-             *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-             return Ok(res);
+             return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Error saving file\n"));
         }
     }
     
@@ -342,11 +327,7 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
         // Stream the file
         let file = match File::open(&path).await {
             Ok(file) => file,
-            Err(_) => {
-                let mut res = Response::new(full("Internal Server Error\n"));
-                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                return Ok(res);
-            }
+            Err(_) => return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n")),
         };
 
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -368,9 +349,7 @@ async fn handle_download(id: String, state: AppState) -> Result<Response<BoxBody
         res.headers_mut().insert("Content-Disposition", format!("attachment; filename=\"{}\"", filename).parse().unwrap());
         Ok(res)
     } else {
-        let mut res = Response::new(full("File not found\n"));
-        *res.status_mut() = StatusCode::NOT_FOUND;
-        Ok(res)
+        Ok(error_response(StatusCode::NOT_FOUND, "File not found\n"))
     }
 }
 
